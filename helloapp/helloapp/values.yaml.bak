@@ -1,0 +1,16 @@
+# replicas number of pod replicas. Note: Opsbot doesn't support multiple replicas when using websockets.
+# this parameter is kept here in prevision of the upcoming move to webhooks: https://api.slack.com/rtm
+replicas: 1
+
+# resourceProfile RAM & CPU requests profile for pods. Accepted values dev, prod.
+# dev: request = max used in ci; prod: over provision for comfortable pod scheduling
+resourceProfile: "dev"
+
+# desiredTag is expected to be passed through command line. Used to compare deployed image to tag targeted at deployment
+desiredTag: "none"
+
+# deploymentJob is expected to be passed trhough command line. Name and id of the job used to deploy.
+deploymentJob: "none"
+
+# logLevel controls Python logging log level. It can be any value compliant with Python logging library. Including "DEBUG"
+logLevel: "INFO"

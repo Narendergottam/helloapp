@@ -1,0 +1,201 @@
+// Import SharedLib located at https://code.tooling.prod.cdsf.io/oam/builds.jenkins.shared-lib.common/tree/master/vars
+@Library(['Common']) _
+
+def microservices = [
+    'helloapp'
+]
+
+pipeline {
+    agent { label 'default' }
+
+    options {
+        // Global imeout period for the Pipeline run, after which Jenkins should abort the Pipeline
+        timeout(time: 120, unit: 'MINUTES')
+        // Enable color in console logs
+        ansiColor('xterm')
+        // Adds timestamps to the console output of Jenkins jobs
+        timestamps()
+        // Disable concurrent builds
+        disableConcurrentBuilds()
+    }
+
+    // Environment variables (can reference credential ids)
+    environment {
+        /*--------------------------------------------------------
+        BASE IMAGES COMMIT ID
+        Modify the BASE_TAG value to set the tag to pull for base images
+        Possible values are commit SHA1 from:
+        https://code.tooling.prod.cdsf.io/kaas/keycore/base-images
+        --------------------------------------------------------*/
+        BASE_TAG =  'latest'
+        /*------------------------------------------------------*/
+        // Deployment variables
+        ENVIRONMENT = 'integration'
+        REGION = 'eu-central-1'
+
+        BRANCH_HASH  = sh(returnStdout: true, script: "echo -n '${branch_name}' | md5sum | awk '{ print \$1 }'")
+        
+
+        // Registry to which we'll push our "run" images
+        DOCKER_REGISTRY_HOSTNAME = "${REPO_CD_HOSTNAME}"
+        DOCKER_ARTIFACTORY_REGISTRY = "${REPO_CI_PUSH}/${PROJECT_NAME}"
+        DOCKER_HARBOR_REGISTRY = "${DOCKER_REGISTRY_HOSTNAME}/${PROJECT_NAME}"
+        DOCKER_HARBOR_CREDENTIALS_ID = 'harbor'
+        DOCKER_ARTIFACTORY_CREDENTIALS_ID = "${REPO_CI_PUSH_CREDENTIALS_ID}"
+        DOCKER_CONFIG="${WORKSPACE}/.docker_config" // Assumes reuseNode is always true
+
+        DEPLOY_IMAGE_NAME = "baseimage"
+        helloapp_BASE_IMAGE_NAME = "helloapp"
+
+        /* AWS configuration */
+        AWS_CREDENTIALS_ID = 'aws_deployment'
+    }
+
+    stages {
+        stage('Init') {
+            agent {
+                docker {
+                  image "${DOCKER_ARTIFACTORY_REGISTRY}/${DEPLOY_IMAGE_NAME}:${BASE_TAG}"
+                  reuseNode true
+                  alwaysPull true
+                  registryUrl "https://${DOCKER_ARTIFACTORY_REGISTRY}"
+                  registryCredentialsId "${DOCKER_ARTIFACTORY_CREDENTIALS_ID}"
+                }
+            }
+
+        }
+
+        stage("Init docker credentials") {
+            steps {
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: DOCKER_ARTIFACTORY_CREDENTIALS_ID, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD']]) {
+                    sh "./ci/docker-login.sh ${DOCKER_ARTIFACTORY_REGISTRY}"
+                }
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: DOCKER_HARBOR_CREDENTIALS_ID, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD']]) {
+                    sh "./ci/docker-login.sh ${DOCKER_HARBOR_REGISTRY}"
+                }
+            }
+        }
+
+        stage('Build helloapp image') {
+            steps {
+                script {
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: DOCKER_HARBOR_CREDENTIALS_ID, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD']]) {
+                        def mustRebuild = "1"
+                        sh """
+                            ci/build_docker_image.sh -r ${DOCKER_HARBOR_REGISTRY} -p helloapp/Dockerfile -n ${helloapp_BASE_IMAGE_NAME} -c . -f $mustRebuild
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Configure AWS profiles') {
+            steps {
+                configureAwsProfiles(env.PROJECT_NAME, env.ENVIRONMENT, env.REGION)
+            }
+        }
+
+        stage('Get K8S kubeconfig') {
+            agent {
+                docker {
+                    image "${REPO_CI_PULL}/cloud/continental/builds/k8s-aws"
+                    args "--entrypoint=''"
+                    alwaysPull true
+                    reuseNode true
+                    registryUrl "https://${REPO_CI_PULL}"
+                    registryCredentialsId "$REPO_CI_PULL_CREDENTIALS_ID"
+                }
+            }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: AWS_CREDENTIALS_ID]]) {
+                    sh "aws s3 cp s3://${KUBECONFIG_S3_BUCKET}/${ENVIRONMENT}/${REGION}/kubeconfig ${KUBECONFIG}"
+                }
+            }
+        }
+
+        stage('Deploy') {
+            agent {
+                docker {
+                  image "${DOCKER_ARTIFACTORY_REGISTRY}/${DEPLOY_IMAGE_NAME}:${BASE_TAG}"
+                  reuseNode true
+                  alwaysPull true
+                  registryUrl "https://${DOCKER_ARTIFACTORY_REGISTRY}"
+                  registryCredentialsId "${DOCKER_ARTIFACTORY_CREDENTIALS_ID}"
+                }
+            }
+
+            stages {
+                stage("Create DEPLOY namespace") {
+                    steps {
+                        sh """
+                            namespaceExists=\$(kubectl get namespace ${NAMESPACE} | grep -c AGE) || true
+                            if [ "\$namespaceExists" -gt 0 ]; then
+                                echo "Namespace ${NAMESPACE} already exists"
+                            else
+                                echo "Creating namespace ${NAMESPACE}"
+                                kubectl create namespace ${NAMESPACE}
+                            fi
+                        """
+                        sh "kubectl config set-context --current --namespace=${NAMESPACE}"
+                        withCredentials([usernamePassword(credentialsId: DOCKER_HARBOR_CREDENTIALS_ID, usernameVariable: 'IMAGE_REPO_USERNAME', passwordVariable: 'IMAGE_REPO_PASSWORD')]) {
+                            sh "chmod +x ./ci/*.sh"
+                            sh "./ci/create_pull_secret.sh -n harbor"
+                            sh "kubectl apply -f harbor-robot-keycore.yaml -n ${NAMESPACE}"
+                        }
+                    }
+                }
+
+                stage('Deploy') {
+                    steps {
+                        dir('deploy/helloapp') {
+                            sh """
+                                helm template \
+                                --namespace ${NAMESPACE} \
+                                -f the_only_values_that_matter.yaml \
+                                -f the_only_secrets_that_matter.yaml \
+                                --set tags.helloapp=${GIT_COMMIT} \
+                                --set desiredTag=${GIT_COMMIT} \
+                                --set deploymentJob=${BUILD_URL} . > release.yaml
+                            """
+                            archiveArtifacts "release.yaml"
+                            sh """
+                                kubectl apply -f release.yaml
+                            """
+                        }
+                    }
+                }
+
+                stage('Wait deployment') {
+                    steps {
+                        timeout(15) {
+                            sh '''while $(kubectl get pods -o wide | grep -v Completed | grep -q "0/1\\|0/2\\|1/2"); do
+                                    kubectl get pods -o wide | grep -v Completed | grep -v "1/1\\|2/2";
+                                    echo "Waiting for all services to come up ...";
+                                    sleep 10;
+                                done'''
+                        }
+                    }
+                }
+            }
+
+            post {
+                always {
+                    script {
+                        cleanNamespace()
+                    }
+                }
+            }
+        }
+    }
+}
+
+def cleanNamespace() {
+    sh """
+        chmod +x ci/*
+        ci/log-devqa.sh || true
+        tar -zcvf ${branch_name}-${build_number}-run.tar.gz logs state
+    """
+    archiveArtifacts "${branch_name}-${build_number}-run.tar.gz"
+
+    sh "kubectl delete namespace ${NAMESPACE}"
+}

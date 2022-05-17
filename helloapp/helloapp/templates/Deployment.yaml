@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: helloapp
+    version: v1
+  name: helloapp
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app: helloapp
+      version: v1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 100%
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: helloapp
+        version: v1
+    spec:
+      containers:
+      - name: helloapp
+        image: {{ .Values.registry }}/helloapp:{{ .Values.tags.helloapp }}
+        imagePullPolicy: Always
+        securityContext:
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          runAsUser: 3000
+          runAsGroup: 3000
+          allowPrivilegeEscalation: false
+        resources:
+          {{- if eq .Values.resourceProfile "dev" }}
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          {{- else }}
+          requests:
+            cpu: 100m
+            memory: 64Mi
+          {{- end }}
+          limits:
+            cpu: 1
+            memory: 256Mi
+
